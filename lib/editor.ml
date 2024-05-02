@@ -1,39 +1,93 @@
 module Editor = struct
-  include Minttea
-  include Leaves
+  include Notty_unix
 
-  type modes = Normal | Insert
-  type t = { cx : int; cy : int; mode : modes; nrows : int; ncols : int }
+  type mode = Normal | Insert
+
+  type action =
+    | Quit
+    | MoveUp
+    | MoveDown
+    | MoveLeft
+    | MoveRight
+    | EnterMode of mode
+    | InsertChar of string
+
+  type t = {
+    cx : int;
+    cy : int;
+    mode : mode;
+    nrows : int;
+    ncols : int;
+    buf : Buffer.t;
+    filename : string option;
+  }
 
   let init () =
+    let term = Term.create () in
     let rows, cols =
-      match Terminal.Size.get_dimensions () with
-      | Some { rows; columns } -> (rows, columns)
+      match Notty_unix.winsize Unix.stdout with
+      | Some (rows, columns) -> (rows, columns)
       | None -> (0, 0)
     in
-    { cx = 0; cy = 0; mode = Normal; nrows = rows; ncols = cols }
+    ( term,
+      {
+        cx = 0;
+        cy = 1;
+        mode = Normal;
+        nrows = rows;
+        ncols = cols;
+        buf = Buffer.create 0;
+        filename = None;
+      } )
 
-  let render editor =
-    let text_style = Spices.(default |> build) in
-    let result = ref "" in
-    for j = 0 to editor.nrows - 1 do
-      for i = 0 to editor.ncols - 1 do
-        let txt =
-          if i = editor.cx && j = editor.cy then
-            Cursor.view (Cursor.make ()) ~text_style:Spices.default " "
-          else text_style "%s" " "
-        in
-        result := !result ^ txt
-      done
-    done;
-    text_style "%s" !result
+  let init_with_file filename =
+    let term = Term.create () in
+    let rows, cols =
+      match Notty_unix.winsize Unix.stdout with
+      | Some (rows, columns) -> (rows, columns)
+      | None -> (0, 0)
+    in
+    ( term,
+      {
+        cx = 0;
+        cy = 1;
+        mode = Normal;
+        nrows = rows;
+        ncols = cols;
+        buf = Buffer.create 0;
+        filename = Some filename;
+      } )
 
-  let update event editor =
-    match event with
-    | Event.KeyDown (Key "q") -> (editor, Command.Quit)
-    | Event.KeyDown Right -> ({ editor with cx = editor.cx + 1 }, Command.Noop)
-    | Event.KeyDown Left -> ({ editor with cx = editor.cx - 1 }, Command.Noop)
-    | Event.KeyDown Up -> ({ editor with cy = editor.cy - 1 }, Command.Noop)
-    | Event.KeyDown Down -> ({ editor with cy = editor.cy + 1 }, Command.Noop)
-    | _ -> (editor, Command.Noop)
+  let render term editor = Term.cursor term (Some (editor.cx, editor.cy))
+
+  let handle_normal_event term =
+    match Term.event term with
+    | `Key (`Arrow `Right, [] | `ASCII 'l', []) -> Some MoveRight
+    | `Key (`Arrow `Left, [] | `ASCII 'h', []) -> Some MoveLeft
+    | `Key (`Arrow `Up, [] | `ASCII 'k', []) -> Some MoveUp
+    | `Key (`Arrow `Down, [] | `ASCII 'j', []) -> Some MoveDown
+    | `Key (`ASCII 'q', []) -> Some Quit
+    | `Key (`ASCII 'i', []) -> Some (EnterMode Normal)
+    | _ -> None
+
+  let handle_insert_event term =
+    match Term.event term with
+    | `Key (`Escape, []) -> Some (EnterMode Normal)
+    | _ -> None
+
+  let handle_event term editor =
+    match editor.mode with
+    | Normal -> handle_normal_event term
+    | Insert -> handle_insert_event term
+
+  let update term editor =
+    let action = handle_event term editor in
+    match action with
+    | Some Quit -> exit 0
+    | Some MoveRight -> { editor with cx = editor.cx + 1 }
+    | Some MoveLeft -> { editor with cx = Int.max 0 (editor.cx - 1) }
+    | Some MoveUp -> { editor with cy = Int.max 0 (editor.cy - 1) }
+    | Some MoveDown -> { editor with cy = editor.cy + 1 }
+    | Some (EnterMode mode) -> { editor with mode }
+    | _ -> editor
 end
