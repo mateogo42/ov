@@ -1,8 +1,8 @@
 open Ov
 
 let rec loop t e =
-  let e = Editor.update t e in
   Editor.render t e;
+  let e = Editor.update t e in
   loop t e
 
 let main () =

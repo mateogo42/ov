@@ -1,6 +1,6 @@
 module Editor = struct
-  include Notty
-  include Notty_unix
+  open Notty
+  open Notty_unix
 
   type mode = Normal | Insert
 
@@ -12,11 +12,14 @@ module Editor = struct
     | MoveRight
     | EnterMode of mode
     | InsertChar of char
+    | DeleteChar
     | InsertNewLine
 
   type t = {
     cx : int;
     cy : int;
+    ox : int;
+    oy : int;
     mode : mode;
     nrows : int;
     ncols : int;
@@ -36,12 +39,14 @@ module Editor = struct
       {
         cx = 0;
         cy = 0;
+        ox = 0;
+        oy = 0;
         mode = Normal;
         nrows = rows - 1;
         ncols = cols;
         buf = Buffer.create 0;
         filename = None;
-        lines = [||];
+        lines = [| "" |];
       } )
 
   let init_with_file filename =
@@ -51,16 +56,20 @@ module Editor = struct
       | Some (cols, rows) -> (rows, cols)
       | None -> (0, 0)
     in
+    let oc = open_in filename in
+    let lines = In_channel.input_lines oc in
     ( term,
       {
         cx = 0;
         cy = 0;
+        ox = 0;
+        oy = 0;
         mode = Normal;
         nrows = rows - 1;
         ncols = cols;
         buf = Buffer.create 0;
         filename = Some filename;
-        lines = [||];
+        lines = Array.of_list lines;
       } )
 
   let handle_normal_event term =
@@ -82,6 +91,7 @@ module Editor = struct
     | `Key (`Escape, []) -> Some (EnterMode Normal)
     | `Key (`ASCII c, []) -> Some (InsertChar c)
     | `Key (`Enter, []) -> Some InsertNewLine
+    | `Key (`Backspace, []) -> Some DeleteChar
     | _ -> None
 
   let handle_event term editor =
@@ -89,36 +99,105 @@ module Editor = struct
     | Normal -> handle_normal_event term
     | Insert -> handle_insert_event term
 
+  let scroll_y editor cy =
+    let oy = Int.min editor.oy cy in
+    if cy >= oy + editor.nrows then cy - editor.nrows + 1 else oy
+
+  let clip_cursor editor =
+    let row = try editor.lines.(editor.cy) with _ -> "" in
+    let row_len = Int.max (String.length row) 0 in
+    { editor with cx = Int.min row_len editor.cx }
+
+  let move_cursor editor cx cy =
+    let editor = { editor with cx; cy; oy = scroll_y editor cy } in
+    clip_cursor editor
+
   let handle_insert_char editor c =
     let c = String.make 1 c in
     if Array.length editor.lines = 0 then
       { editor with lines = [| c |]; cx = succ editor.cx }
     else
-      let line = editor.lines.(editor.cy) ^ c in
-      editor.lines.(editor.cy) <- line;
+      let line = editor.lines.(editor.cy) in
+      let left = String.sub line 0 editor.cx in
+      let right = String.sub line editor.cx (String.length line - editor.cx) in
+      editor.lines.(editor.cy) <- left ^ c ^ right;
       { editor with cx = succ editor.cx }
+
+  let handle_newline editor =
+    let before = Array.sub editor.lines 0 editor.cy in
+    let after =
+      Array.sub editor.lines (editor.cy + 1)
+        (Array.length editor.lines - editor.cy - 1)
+    in
+    let line = editor.lines.(editor.cy) in
+    let prev_line = String.sub line 0 editor.cx in
+    let new_line =
+      String.sub editor.lines.(editor.cy) editor.cx
+        (String.length line - editor.cx)
+    in
+    let editor =
+      {
+        editor with
+        lines = Array.concat [ before; [| prev_line; new_line |]; after ];
+      }
+    in
+    move_cursor editor 0 (succ editor.cy)
+
+  let handle_delete_char editor =
+    let editor =
+      if editor.cx = 0 && editor.cy = 0 then editor
+      else if editor.cx = 0 then
+        let line = editor.lines.(editor.cy) in
+        let prev_line = editor.lines.(editor.cy - 1) in
+        let before = Array.sub editor.lines 0 (editor.cy - 1) in
+        let after =
+          try
+            Array.sub editor.lines (editor.cy + 1)
+              (Array.length editor.lines - editor.cy - 1)
+          with _ -> [||]
+        in
+        {
+          editor with
+          lines = Array.concat [ before; [| prev_line ^ line |]; after ];
+          cy = pred editor.cy;
+          cx = String.length prev_line;
+        }
+      else
+        let line = editor.lines.(editor.cy) in
+        let before = String.sub line 0 (editor.cx - 1) in
+        let after =
+          try String.sub line editor.cx (String.length line - editor.cx)
+          with _ -> ""
+        in
+        editor.lines.(editor.cy) <- before ^ after;
+        { editor with cx = pred editor.cx }
+    in
+    move_cursor editor editor.cx editor.cy
 
   let update term editor =
     let action = handle_event term editor in
     match action with
     | Some Quit -> exit 0
-    | Some MoveRight -> { editor with cx = editor.cx + 1 }
-    | Some MoveLeft -> { editor with cx = Int.max 0 (editor.cx - 1) }
-    | Some MoveUp -> { editor with cy = Int.max 0 (editor.cy - 1) }
-    | Some MoveDown -> { editor with cy = editor.cy + 1 }
+    | Some MoveRight -> move_cursor editor (succ editor.cx) editor.cy
+    | Some MoveLeft -> move_cursor editor (Int.max 0 (editor.cx - 1)) editor.cy
+    | Some MoveUp -> move_cursor editor editor.cx (Int.max 0 (pred editor.cy))
+    | Some MoveDown ->
+        move_cursor editor editor.cx
+          (Int.min (Array.length editor.lines - 1) (succ editor.cy))
     | Some (InsertChar c) -> handle_insert_char editor c
-    | Some InsertNewLine -> { editor with cy = succ editor.cy }
+    | Some DeleteChar -> handle_delete_char editor
+    | Some InsertNewLine -> handle_newline editor
     | Some (EnterMode mode) -> { editor with mode }
     | _ -> editor
 
   let draw_lines editor =
-    List.mapi
-      (fun i _ ->
+    List.map
+      (fun i ->
         if i < Array.length editor.lines then
           let line = editor.lines.(i) in
           I.string A.empty line
         else I.string A.empty "~")
-      (List.init editor.nrows (fun n -> n))
+      (List.init editor.nrows (fun n -> n + editor.oy))
 
   let draw_statusbar editor =
     let mode =
@@ -127,9 +206,19 @@ module Editor = struct
     let mode_img = I.string A.(bg magenta ++ fg black) mode in
     let filename = Option.value editor.filename ~default:"[No Name]" in
     let filename_img = I.string A.(fg yellow) filename in
-    I.(mode_img <|> void 2 0 <|> filename_img)
+    let editor_pos =
+      Format.sprintf "%5d:%d     " (editor.cy + 1) (Array.length editor.lines)
+    in
+    let editor_pos_img = I.string A.(bg blue ++ fg black) editor_pos in
+
+    let space =
+      editor.ncols - String.length filename - String.length mode
+      - String.length editor_pos
+    in
+    I.(
+      mode_img <|> void 2 0 <|> filename_img <|> void space 0 <|> editor_pos_img)
 
   let render term editor =
-    Term.cursor term (Some (editor.cx, editor.cy));
+    Term.cursor term (Some (editor.cx - editor.ox, editor.cy - editor.oy));
     Term.image term (I.vcat (draw_lines editor @ [ draw_statusbar editor ]))
 end
