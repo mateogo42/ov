@@ -1,0 +1,3 @@
+(library
+ (name ov)
+ (libraries minttea leaves spices terminal))

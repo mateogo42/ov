@@ -1,0 +1,4 @@
+(executable
+ (public_name ov)
+ (name main)
+ (libraries ov minttea leaves terminal))
