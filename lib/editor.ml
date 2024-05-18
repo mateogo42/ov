@@ -2,7 +2,8 @@ module Editor = struct
   open Notty
   open Notty_unix
 
-  type mode = Normal | Insert
+  type mode = Normal | Insert | Command
+  type subaction = G
 
   type action =
     | Quit
@@ -14,18 +15,29 @@ module Editor = struct
     | InsertChar of char
     | DeleteChar
     | InsertNewLine
+    | InsertLineAbove
+    | InsertLineBelow
+    | MoveCursorForward
+    | MoveToEndOfLine of mode
+    | MoveToStartOfFile
+    | MoveToEndOfFile
+    | SetSubAction of subaction
+    | ExecCmd
 
   type t = {
     cx : int;
     cy : int;
     ox : int;
     oy : int;
+    cmd : Buffer.t;
     mode : mode;
     nrows : int;
     ncols : int;
     buf : Buffer.t;
     filename : string option;
     lines : string array;
+    subaction : subaction option;
+    logger : Out_channel.t;
   }
 
   let init () =
@@ -41,12 +53,15 @@ module Editor = struct
         cy = 0;
         ox = 0;
         oy = 0;
+        cmd = Buffer.create 0;
         mode = Normal;
         nrows = rows - 1;
         ncols = cols;
         buf = Buffer.create 0;
         filename = None;
         lines = [| "" |];
+        subaction = None;
+        logger = open_out "ov.log";
       } )
 
   let init_with_file filename =
@@ -64,22 +79,34 @@ module Editor = struct
         cy = 0;
         ox = 0;
         oy = 0;
+        cmd = Buffer.create 0;
         mode = Normal;
         nrows = rows - 1;
         ncols = cols;
         buf = Buffer.create 0;
         filename = Some filename;
         lines = Array.of_list lines;
+        subaction = None;
+        logger = open_out "ov.log";
       } )
 
-  let handle_normal_event term =
+  let handle_normal_event editor term =
     match Term.event term with
     | `Key (`Arrow `Right, [] | `ASCII 'l', []) -> Some MoveRight
     | `Key (`Arrow `Left, [] | `ASCII 'h', []) -> Some MoveLeft
     | `Key (`Arrow `Up, [] | `ASCII 'k', []) -> Some MoveUp
     | `Key (`Arrow `Down, [] | `ASCII 'j', []) -> Some MoveDown
-    | `Key (`ASCII 'q', []) -> Some Quit
     | `Key (`ASCII 'i', []) -> Some (EnterMode Insert)
+    | `Key (`ASCII ':', []) -> Some (EnterMode Command)
+    | `Key (`ASCII 'w', []) -> Some MoveCursorForward
+    | `Key (`ASCII 'A', []) -> Some (MoveToEndOfLine Insert)
+    | `Key (`ASCII 'o', []) -> Some InsertLineBelow
+    | `Key (`ASCII 'O', []) -> Some InsertLineAbove
+    | `Key (`ASCII '$', []) -> Some (MoveToEndOfLine Normal)
+    | `Key (`ASCII 'G', []) -> Some MoveToEndOfFile
+    | `Key (`ASCII 'g', []) when editor.subaction = Some G ->
+        Some MoveToStartOfFile
+    | `Key (`ASCII 'g', []) -> Some (SetSubAction G)
     | _ -> None
 
   let handle_insert_event term =
@@ -94,10 +121,32 @@ module Editor = struct
     | `Key (`Backspace, []) -> Some DeleteChar
     | _ -> None
 
+  let get_action_from_command editor =
+    let cmd = Buffer.contents editor.cmd in
+    match cmd with
+    | _ when String.starts_with ~prefix:"q" cmd -> Some Quit
+    | _ -> None
+
+  let handle_command editor term =
+    match Term.event term with
+    | `Key (`Backspace, []) ->
+        if Buffer.length editor.cmd > 0 then
+          Buffer.truncate editor.cmd (Buffer.length editor.cmd - 1);
+        None
+    | `Key (`Escape, []) ->
+        Buffer.reset editor.cmd;
+        Some (EnterMode Normal)
+    | `Key (`Enter, []) -> get_action_from_command editor
+    | `Key (`ASCII c, []) ->
+        Buffer.add_char editor.cmd c;
+        None
+    | _ -> None
+
   let handle_event term editor =
     match editor.mode with
-    | Normal -> handle_normal_event term
+    | Normal -> handle_normal_event editor term
     | Insert -> handle_insert_event term
+    | Command -> handle_command editor term
 
   let scroll_y editor cy =
     let oy = Int.min editor.oy cy in
@@ -174,6 +223,36 @@ module Editor = struct
     in
     move_cursor editor editor.cx editor.cy
 
+  let handle_motion_forward editor =
+    let s = Str.regexp {|[a-zA-Z0-9]* +\([a-zA-Z0-9]+\)|} in
+    let line = editor.lines.(editor.cy) in
+    let _ = Str.string_match s line editor.cx in
+    let pos = try Str.group_beginning 1 with _ -> editor.cx in
+    { editor with cx = pos }
+
+  let handle_move_to_end_of_line mode editor =
+    let line = editor.lines.(editor.cy) in
+    let len = String.length line in
+    { editor with cx = len; mode }
+
+  let handle_move_to_end_of_file editor =
+    let len = Array.length editor.lines in
+    match len with 0 -> editor | _ -> { editor with cy = len - 1 }
+
+  let handle_insert_line editor off =
+    match Array.length editor.lines with
+    | 0 ->
+        let lines = Array.append editor.lines [| "" |] in
+        { editor with lines; cy = editor.cy + off; cx = 0 }
+    | _ ->
+        let above = Array.sub editor.lines 0 (editor.cy + off) in
+        let below =
+          Array.sub editor.lines (editor.cy + off)
+            (Array.length editor.lines - editor.cy - off)
+        in
+        let lines = Array.concat [ above; [| "" |]; below ] in
+        { editor with lines; cx = 0; cy = editor.cy + off; mode = Insert }
+
   let update term editor =
     let action = handle_event term editor in
     match action with
@@ -188,6 +267,13 @@ module Editor = struct
     | Some DeleteChar -> handle_delete_char editor
     | Some InsertNewLine -> handle_newline editor
     | Some (EnterMode mode) -> { editor with mode }
+    | Some MoveCursorForward -> handle_motion_forward editor
+    | Some (MoveToEndOfLine mode) -> handle_move_to_end_of_line mode editor
+    | Some MoveToEndOfFile -> handle_move_to_end_of_file editor
+    | Some MoveToStartOfFile -> { editor with cx = 0; cy = 0; subaction = None }
+    | Some (SetSubAction a) -> { editor with subaction = Some a }
+    | Some InsertLineAbove -> handle_insert_line editor 0
+    | Some InsertLineBelow -> handle_insert_line editor 1
     | _ -> editor
 
   let draw_lines editor =
@@ -201,7 +287,10 @@ module Editor = struct
 
   let draw_statusbar editor =
     let mode =
-      match editor.mode with Normal -> "  NORMAL  " | Insert -> "  INSERT  "
+      match editor.mode with
+      | Normal -> "  NORMAL  "
+      | Insert -> "  INSERT  "
+      | _ -> ":" ^ Buffer.contents editor.cmd
     in
     let mode_img = I.string A.(bg magenta ++ fg black) mode in
     let filename = Option.value editor.filename ~default:"[No Name]" in
